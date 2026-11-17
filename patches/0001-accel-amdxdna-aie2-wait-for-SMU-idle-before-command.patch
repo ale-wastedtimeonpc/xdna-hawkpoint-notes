@@ -1,0 +1,47 @@
+From: Ale <345759907+ale-wastedtimeonpc@users.noreply.github.com>
+Subject: [PATCH] accel/amdxdna: aie2: wait for SMU idle before issuing a command
+
+On a Ryzen 9 PRO 8945HS (Hawk Point, npu1 / aie2) the in-tree amdxdna 0.7.0
+driver occasionally logs "smu cmd 6 timed out" during runtime resume, when the
+DPM H-clock is changed. The amd/xdna-driver main branch avoids this by waiting
+for the SMU to finish the previous command (bit 1 of SMU_INTR_REG) before
+writing a new one, and by not clearing SMU_INTR_REG before the kick.
+
+This is a test backport of that wait to the in-tree aie2_smu.c only.
+Tested with 4,253 forced runtime resumes in 2 hours: 0 SMU timeouts
+(before: 1 in 40 and 1 in 643). Details: amd/xdna-driver#1805.
+
+Not an official AMD patch. Use at your own risk.
+---
+--- a/drivers/accel/amdxdna/aie2_smu.c
++++ b/drivers/accel/amdxdna/aie2_smu.c
+@@ -32,15 +32,26 @@
+ static int aie2_smu_exec(struct amdxdna_dev_hdl *ndev, u32 reg_cmd,
+ 			 u32 reg_arg, u32 *out)
+ {
+-	u32 resp;
++	u32 resp, intr;
+ 	int ret;
+ 
++	/*
++	 * Wait until the SMU has finished the previous command (bit 1 of
++	 * SMU_INTR_REG) before writing a new one, as amd/xdna-driver main does
++	 * in aie_smu_exec() for npu1 (smu_intr_enabled). Test backport only.
++	 */
++	ret = readx_poll_timeout(readl, SMU_REG(ndev, SMU_INTR_REG), intr,
++				 !(intr & 0x2), AIE2_INTERVAL, AIE2_TIMEOUT);
++	if (ret) {
++		XDNA_ERR(ndev->xdna, "wait for smu intr idle timed out: 0x%x", intr);
++		return ret;
++	}
++
+ 	writel(0, SMU_REG(ndev, SMU_RESP_REG));
+ 	writel(reg_arg, SMU_REG(ndev, SMU_ARG_REG));
+ 	writel(reg_cmd, SMU_REG(ndev, SMU_CMD_REG));
+ 
+-	/* Clear and set SMU_INTR_REG to kick off */
+-	writel(0, SMU_REG(ndev, SMU_INTR_REG));
++	/* Set SMU_INTR_REG to kick off (no clear first, as in main) */
+ 	writel(1, SMU_REG(ndev, SMU_INTR_REG));
+ 
+ 	ret = readx_poll_timeout(readl, SMU_REG(ndev, SMU_RESP_REG), resp,
